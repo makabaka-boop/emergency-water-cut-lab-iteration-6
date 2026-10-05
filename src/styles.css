@@ -411,3 +411,24 @@ tr.tone-row.tone-saturated > td {
 tr.tone-row.tone-short > td {
   background: #fdecec;
 }
+
+/* 单管复通建议：推荐行、推荐徽标与改善差额着色。 */
+tr.restore-recommended > td {
+  background: #f2faf4;
+}
+
+.restore-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #e9f7ef;
+  border: 1px solid #1e7d46;
+  color: #175e37;
+  font-size: 12px;
+}
+
+.delta-good {
+  color: #175e37;
+  font-weight: 600;
+}
