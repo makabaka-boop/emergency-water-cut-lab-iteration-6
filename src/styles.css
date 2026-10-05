@@ -411,3 +411,13 @@ tr.tone-row.tone-saturated > td {
 tr.tone-row.tone-short > td {
   background: #fdecec;
 }
+
+/* 单管复通建议：候选差额（改善为绿、无变化为灰）。 */
+.delta-pos {
+  color: #175e37;
+  font-weight: 600;
+}
+
+.delta-zero {
+  color: var(--muted);
+}

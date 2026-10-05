@@ -15,6 +15,12 @@ import {
   reduceLoad,
   settleFileRead,
 } from './core/loader'
+import {
+  RestoreAdviceEmpty,
+  RestoreAdviceSolved,
+  adviseRestoration,
+  confirmRestoration,
+} from './core/restore'
 import { SAMPLE_TEXT } from './core/sample'
 import { Analysis, CutItem, CutKind, Model, SinkInterval } from './core/types'
 
@@ -541,8 +547,187 @@ function GapDiagnosisPanel({
   )
 }
 
-export default function App() {
-  const [loader, setLoader] = useState(initialLoaderState)
+/**
+ * 单管复通建议面板（opt-in，显式生成）。
+ *
+ * 抢修队一次只能先复通一条已停用管段。点击「生成复通建议」后，核心层在
+ * 互不污染的方案副本上逐条恢复候选管段（至多 20 条，停用 id UTF-16 升序），
+ * 沿现有最大流与最小承诺缺口数据流重算其最大总供水量与缺口见证，按
+ * 总缺口最小 → 复通后供水量最大 → 管段 ID 稳定排序。页面只展示当前方案
+ * 与各候选的差额：建议与候选见证都不是已应用结果，不参与网络着色与导出。
+ * 「确认复通」时核心层重核 模型 + 停用集合 + 承诺 签名与复通后最大流，
+ * 过期或被篡改的建议一律拒绝，计算/确认失败保留原方案与报告。
+ */
+type RestoreRunState =
+  | { status: 'idle' }
+  | {
+      status: 'done'
+      advice: RestoreAdviceSolved | RestoreAdviceEmpty
+      /** 生成时的输入签名（与已提交诊断同一口径）；不一致即过期。 */
+      signature: string
+    }
+  | { status: 'failed'; reason: string }
+
+function RestoreAdvicePanel({
+  runState,
+  stale,
+  hasInvalid,
+  confirmed,
+  confirmError,
+  onRun,
+  onConfirm,
+}: {
+  runState: RestoreRunState
+  stale: boolean
+  hasInvalid: boolean
+  confirmed: { arcId: string; maxSupply: number; totalGap: number } | null
+  confirmError: string | null
+  onRun: () => void
+  onConfirm: (arcId: string) => void
+}) {
+  const solved =
+    runState.status === 'done' && 'candidates' in runState.advice
+      ? runState.advice
+      : null
+  const emptyStatus =
+    runState.status === 'done' && !stale && !('candidates' in runState.advice)
+      ? runState.advice.status
+      : null
+
+  return (
+    <div className="interval-box">
+      <p className="muted interval-note">
+        抢修队一次只能先复通一条已停用管段。本建议在互不污染的方案副本上逐条
+        恢复候选管段，重算其最大总供水量与缺口见证，帮助调度员判断哪条最能
+        缩小安置点承诺缺口。<strong>建议与候选见证都不是已应用结果</strong>；
+        「确认复通」时才核对模型、停用集合与承诺仍未变化，过期建议不会覆盖
+        现场新操作。
+      </p>
+      <div className="arc-toolbar gap-actions">
+        <button onClick={onRun} disabled={hasInvalid}>
+          生成复通建议
+        </button>
+        {hasInvalid && (
+          <span className="commit-field-error" role="alert">
+            存在无效承诺填写，请先修正
+          </span>
+        )}
+      </div>
+
+      {runState.status === 'failed' && (
+        <p className="interval-error" role="alert">
+          复通建议计算失败：{runState.reason}。已保留当前方案与报告不变。
+        </p>
+      )}
+      {confirmError && (
+        <p className="interval-error" role="alert">
+          确认复通被拒绝：{confirmError}
+        </p>
+      )}
+      {stale && runState.status === 'done' && (
+        <p className="gap-stale" role="status">
+          承诺填写或停用管段已变化：以下建议为上次生成版本，已过期，不能确认；
+          重新「生成复通建议」后刷新。
+        </p>
+      )}
+      {confirmed && (
+        <p className="commit-feasible" role="status">
+          ✔ 已按确认复通管段「{confirmed.arcId}」：当前方案最大供水量{' '}
+          {formatInt(confirmed.maxSupply)}，最小总缺口{' '}
+          {formatInt(confirmed.totalGap)}；原建议列表已过期。
+        </p>
+      )}
+      {emptyStatus === 'no-disabled' && (
+        <p className="muted interval-note">
+          当前没有已停用管段，无可评估的复通候选。
+        </p>
+      )}
+      {emptyStatus === 'no-commitments' && (
+        <p className="muted interval-note">
+          尚未填写有效的最低供水承诺：复通建议以缩小安置点承诺缺口为目标，
+          请先在上方承诺表中填写。
+        </p>
+      )}
+
+      {solved && (
+        <>
+          <div className="value-row">
+            <ValueBlock
+              label="当前最大供水量"
+              value={formatInt(solved.current.maxSupply)}
+            />
+            <ValueBlock
+              label="当前最小总缺口"
+              value={formatInt(solved.current.totalGap)}
+            />
+            <ValueBlock
+              label="评估候选 / 停用总数"
+              value={`${solved.evaluated} / ${solved.disabledTotal}`}
+            />
+          </div>
+          {solved.status === 'no-improvement' ? (
+            <p className="commit-infeasible" role="status">
+              候选无改善：没有任何单管复通能进一步缩小当前总缺口
+              （各候选相对当前方案的差额如下）。
+            </p>
+          ) : (
+            <p className="muted interval-note">
+              候选按 总缺口最小 → 复通后供水量最大 → 管段 ID 排序；
+              差额均相对当前方案。
+            </p>
+          )}
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>复通管段</th>
+                <th className="num">复通后最大供水量</th>
+                <th className="num">供水差额</th>
+                <th className="num">复通后总缺口</th>
+                <th className="num">缺口差额</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {solved.candidates.map((c) => (
+                <tr key={c.arcId}>
+                  <td className="mono">{c.arcId}</td>
+                  <td className="num mono">{formatInt(c.maxSupply)}</td>
+                  <td
+                    className={`num mono ${c.supplyDelta > 0 ? 'delta-pos' : 'delta-zero'}`}
+                  >
+                    {c.supplyDelta > 0 ? `+${formatInt(c.supplyDelta)}` : '0'}
+                  </td>
+                  <td className="num mono">{formatInt(c.totalGap)}</td>
+                  <td
+                    className={`num mono ${c.gapDelta < 0 ? 'delta-pos' : 'delta-zero'}`}
+                  >
+                    {c.gapDelta < 0 ? `-${formatInt(-c.gapDelta)}` : '0'}
+                  </td>
+                  <td>
+                    <button
+                      className="link-btn"
+                      disabled={stale}
+                      title={stale ? '建议已过期，请重新生成' : undefined}
+                      onClick={() => onConfirm(c.arcId)}
+                    >
+                      确认复通
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="muted interval-note">
+            以上为评估结果：候选的最大供水量与缺口见证均未应用到当前方案，
+            网络着色仍只来自已提交的缺口诊断；确认复通只改动停用集合。
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
+export default function App() {  const [loader, setLoader] = useState(initialLoaderState)
   const [disabled, setDisabled] = useState<ReadonlySet<string>>(new Set())
   const [filter, setFilter] = useState('')
   const [page, setPage] = useState(0)
@@ -552,6 +737,20 @@ export default function App() {
   const [commitments, setCommitments] = useState<Record<string, string>>({})
   // 最小承诺缺口诊断的「已提交结果」（显式运行才产生；摘要/着色/导出共用它）。
   const [gapRun, setGapRun] = useState<GapRunState>({ status: 'idle' })
+  // 单管复通建议的「已生成结果」（显式生成才产生；仅为评估，未应用）。
+  const [restoreRun, setRestoreRun] = useState<RestoreRunState>({
+    status: 'idle',
+  })
+  // 确认复通被拒绝的原因（过期/被篡改等）；确认失败保留原方案与报告。
+  const [restoreConfirmError, setRestoreConfirmError] = useState<string | null>(
+    null,
+  )
+  // 最近一次确认成功的复通结果（仅作回执展示）。
+  const [restoreConfirmed, setRestoreConfirmed] = useState<{
+    arcId: string
+    maxSupply: number
+    totalGap: number
+  } | null>(null)
   // 文件读取令牌：单调递增，只有仍是在途读取的回填才会被采用。
   const fileToken = useRef(0)
 
@@ -612,6 +811,9 @@ export default function App() {
     setSelectedSink('')
     setCommitments({})
     setGapRun({ status: 'idle' })
+    setRestoreRun({ status: 'idle' })
+    setRestoreConfirmError(null)
+    setRestoreConfirmed(null)
   }
 
   // 基线方案解（含建模边身份与正反残量），供区间分析复用。
@@ -787,6 +989,67 @@ export default function App() {
       ? gapRun.diagnosis
       : null
   const gapStale = gapRun.status === 'done' && gapRun.signature !== gapSignature
+
+  // 显式生成：对当前停用管段逐条评估单管复通（纯评估，不改演练方案）。
+  // 计算失败只更新失败提示，当前方案、报告与已提交诊断全部保留。
+  const runRestoreAdvice = () => {
+    if (!model) return
+    if (parsedCommitments.invalidNodes.length > 0) return
+    try {
+      const result = adviseRestoration(
+        model.network,
+        disabled,
+        parsedCommitments.filled,
+      )
+      if (!result.ok) {
+        setRestoreRun({ status: 'failed', reason: result.reason })
+      } else {
+        setRestoreRun({ status: 'done', advice: result, signature: gapSignature })
+      }
+    } catch (err) {
+      setRestoreRun({
+        status: 'failed',
+        reason: err instanceof Error ? err.message : String(err),
+      })
+    }
+    setRestoreConfirmError(null)
+    setRestoreConfirmed(null)
+  }
+
+  // 建议过期判定（与已提交诊断同一签名口径：模型/停用集合/承诺原文/当前总量）。
+  const restoreStale =
+    restoreRun.status === 'done' && restoreRun.signature !== gapSignature
+
+  // 确认复通：核心层重核签名（模型/停用集合/承诺）与复通后最大流；
+  // 任何核对失败都拒绝改动，保留原方案与报告。
+  const confirmRestore = (arcId: string) => {
+    if (!model || restoreRun.status !== 'done') return
+    if (restoreRun.signature !== gapSignature) return // 过期建议不得确认
+    const advice = restoreRun.advice
+    if (!('candidates' in advice)) return
+    try {
+      const result = confirmRestoration(model.network, advice, arcId, {
+        disabled,
+        commitments: parsedCommitments.filled,
+      })
+      if (!result.ok) {
+        setRestoreConfirmError(result.reason)
+        return
+      }
+      setRestoreConfirmError(null)
+      setRestoreConfirmed({
+        arcId: result.arcId,
+        maxSupply: result.maxSupply,
+        totalGap: result.totalGap,
+      })
+      // 确认成功才改动演练方案；建议随之过期（签名不再一致）。
+      setDisabled(new Set(result.disabled))
+    } catch (err) {
+      setRestoreConfirmError(
+        err instanceof Error ? err.message : String(err),
+      )
+    }
+  }
 
   // 见证流量按边 id 建图（管段 / 需求点），供割项表与管段清单同源着色。
   const witnessFlowById = useMemo(() => {
@@ -1061,6 +1324,17 @@ export default function App() {
                   stale={gapStale}
                   onRun={runGapDiagnosis}
                   onExportWitness={exportGapWitness}
+                />
+
+                <h3>单管复通建议（显式生成）</h3>
+                <RestoreAdvicePanel
+                  runState={restoreRun}
+                  stale={restoreStale}
+                  hasInvalid={parsedCommitments.invalidNodes.length > 0}
+                  confirmed={restoreConfirmed}
+                  confirmError={restoreConfirmError}
+                  onRun={runRestoreAdvice}
+                  onConfirm={confirmRestore}
                 />
               </>
             )}
